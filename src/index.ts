@@ -452,7 +452,42 @@ async function fetchWithTimeout(
         ),
       );
     }
-    throw err;
+    // Fleet #2382. Everything that isn't a timeout/abort here is a genuine
+    // NETWORK-LEVEL failure — DNS resolution, connection refused, TLS handshake,
+    // Cloudflare's own "Network connection lost." — meaning `fetch()` itself
+    // threw and no HTTP response of any kind was ever received. Until this fix
+    // that raw exception was rethrown VERBATIM: a bare `TypeError: fetch failed`
+    // (or the Workers-runtime equivalent) names no upstream, carries no class
+    // token, and reads exactly like a defect in OUR code — because it says
+    // nothing about the call at all. It landed in `error`, the tier that means
+    // "Pipeworx has a defect", for every one of the (at the time of writing)
+    // ~470 packs that call this helper directly with no wrapper of their own.
+    //
+    // `dexscreener` hit this independently (fleet #1579) and fixed it with a
+    // bespoke per-pack try/catch around `fetchWithTimeout`. That fix is correct
+    // but only covers one pack; every other caller of this shared helper still
+    // leaked the raw exception. Moving the same fix HERE — the one place that
+    // already carries the timeout case — covers every pack that uses
+    // `fetchWithTimeout` without a wrapper, for free, and without widening
+    // `classifyToolError`'s regex list: the fix is giving the message a proper
+    // `upstream_down:` token at the point the two facts (no response was ever
+    // received, and which host we were trying to reach) are actually in hand,
+    // not teaching the classifier to guess from prose after the fact.
+    //
+    // Safe on the same grounds as the timeout branch above: no argument a
+    // caller passes can make `fetch()` itself throw a connection-level error,
+    // so this is always an availability failure, never a caller mistake. Same
+    // `markInternalOrigin` treatment — an origin we run that never answered is
+    // still ours, not a third party's outage.
+    const raw = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      markInternalOrigin(
+        `upstream_down: could not reach ${name} at all (${raw.slice(0, 160)}). ` +
+          `No request reached ${name}, so this says NOTHING about whether the arguments you passed ` +
+          'are valid — do not re-check them on the strength of this error. Retry shortly.',
+        url,
+      ),
+    );
   }
 }
 
@@ -841,6 +876,15 @@ function formatBackcompatSummary(r: OdpRecord) {
     grant_date: meta.grantDate ?? null,
     filing_date: meta.filingDate ?? null,
     first_inventor: meta.firstInventorName ?? null,
+    // Added fleet #2446: "who has filed patents on X" was answered with the
+    // first INVENTOR (a person) because that was the only name in this
+    // back-compat shape — even though `patents[].applicants` already carried
+    // the filing organisation. `results` is listed first in the response and
+    // is the shape entity_profile/recent_changes already consume, so the
+    // organisation needs to be visible here too, not only in the fuller
+    // `patents` array below.
+    first_applicant: meta.firstApplicantName ?? null,
+    applicants: (meta.applicantBag ?? []).map((a) => a.applicantNameText ?? null).filter(Boolean),
   };
 }
 
@@ -1145,6 +1189,10 @@ async function searchPatents(args: Record<string, unknown>) {
   const quotedPhraseCount = query ? (query.match(/"[^"]+"/g) ?? []).length : 0;
   let broadened = false;
   let broadenedFrom: string | null = null;
+  // Set only when the rerank below actually ran, so the response can say so
+  // (fleet #2446) — distinct from `broadened`, which just means the OR retry
+  // matched something.
+  let rankedByPhraseMatch: string[] | null = null;
   if (total === 0 && queryClauses.length > 1 && quotedPhraseCount >= 2) {
     broadenedFrom = composedQ;
     const orClause = `(${queryClauses.join(' ')})`;
@@ -1156,6 +1204,33 @@ async function searchPatents(args: Record<string, unknown>) {
     all = data.patentFileWrapperDataBag ?? [];
     total = data.count ?? all.length;
     broadened = total > 0;
+
+    // Rank the OR-broadened rows by how many of the ORIGINAL phrases each one
+    // actually matches (fleet #2446). ODP's own relevance order doesn't know
+    // which of the OR'd phrases mattered, so a broadened search can rank a row
+    // that only mentions ONE of several distinct original concepts ahead of
+    // one that matches several — live example: the cfRNA query above, OR'd
+    // across "cell-free RNA" / "residual cancer" / "minimal residual disease",
+    // pulled in unrelated kidney-injury and tuberculosis filings interleaved
+    // with genuinely on-topic ones. The invention title is the only free text
+    // ODP returns in a search result (no abstract/claims here), so this is a
+    // cheap best-effort: count phrase hits in the title and stable-sort by
+    // that count, keeping ODP's own (recency) order as the tiebreak — it
+    // costs no extra API call and reliably pushes multi-phrase matches above
+    // single-phrase ones.
+    if (broadened) {
+      const phrases = queryClauses.map((c) => c.replace(/^"|"$/g, '').toLowerCase()).filter(Boolean);
+      if (phrases.length > 0) {
+        const scored = all.map((r, idx) => {
+          const t = (r.applicationMetaData?.inventionTitle ?? '').toLowerCase();
+          const score = phrases.reduce((n, p) => n + (t.includes(p) ? 1 : 0), 0);
+          return { r, idx, score };
+        });
+        scored.sort((a, b) => b.score - a.score || a.idx - b.idx);
+        all = scored.map((s) => s.r);
+        rankedByPhraseMatch = phrases;
+      }
+    }
   }
 
   const records = all.slice(0, limit);
@@ -1228,7 +1303,10 @@ async function searchPatents(args: Record<string, unknown>) {
     ...(broadened
       ? {
           broadened: true,
-          broadening_note: `The literal query (${broadenedFrom}) matched 0 patents, so this retried the same phrases OR'd together instead of AND'd (${composedQ}). Read these results as "mentions at least one of the phrases", not all of them — narrow again with a more specific query, applicant, or date range if this is too broad.`,
+          broadening_note: `The literal query (${broadenedFrom}) matched 0 patents, so this retried the same phrases OR'd together instead of AND'd (${composedQ}). Read these results as "mentions at least one of the phrases", not all of them — narrow again with a more specific query, applicant, or date range if this is too broad.`
+            + (rankedByPhraseMatch
+              ? ` Rows below are ranked by how many of the original phrases (${rankedByPhraseMatch.join(', ')}) appear in the title — most on-topic first, ties keep ODP's own order — not by ODP's own relevance ordering.`
+              : ''),
         }
       : {}),
     ...(total === 0 && !broadened && grantedRange && !filedRange
