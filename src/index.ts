@@ -1066,7 +1066,7 @@ const tools: McpToolExport['tools'] = [
         query: {
           type: 'string',
           description:
-            'Free-text keywords. Every term must appear (they are AND-ed), so add words to narrow and remove words to widen. Wrap words in double quotes to require them adjacent: `"machine learning" model` needs the exact phrase plus the word model. Examples: "lithium battery", "crispr", "neural network". Pass "*" if you only want to filter by applicant/date with no keyword constraint. A curated set of known synonyms/abbreviations (e.g. cfRNA / cell-free RNA / circulating RNA, or MRD / minimal residual disease / residual cancer) is automatically expanded to an OR group within the query — quoted or bare, either form is recognized — so you do not need to guess which exact wording a given patent uses (see `synonyms_expanded` in the response). If several quoted phrases ANDed together still match nothing, the tool retries once with them OR\'d instead (see `broadened` in the response) rather than returning a bare zero.',
+            'Free-text keywords. Every term must appear (they are AND-ed), so add words to narrow and remove words to widen. Wrap words in double quotes to require them adjacent: `"machine learning" model` needs the exact phrase plus the word model. Examples: "lithium battery", "crispr", "neural network". Pass "*" if you only want to filter by applicant/date with no keyword constraint. A curated set of known synonyms/abbreviations (e.g. cfRNA / cell-free RNA / circulating RNA, or MRD / minimal residual disease / residual cancer) is automatically expanded to an OR group within the query — quoted or bare, either form is recognized — so you do not need to guess which exact wording a given patent uses (see `synonyms_expanded` in the response). If several quoted phrases — or two recognized synonym-group concepts, quoted or not — ANDed together still match nothing, the tool retries once with them OR\'d instead (see `broadened` in the response) rather than returning a bare zero.',
         },
         applicant: {
           type: 'string',
@@ -1274,7 +1274,8 @@ async function searchPatents(args: Record<string, unknown>) {
   // operator, so simply not inserting "AND" between them) turns that into a
   // real answer.
   //
-  // Deliberately gated on >=2 QUOTED phrases, not just >=2 clauses: a bare
+  // Deliberately gated on >=2 QUOTED phrases (OR >=2 recognized synonym
+  // groups, fleet #2450/#2499 — see below), not just >=2 clauses: a bare
   // multi-word keyword search like {query: "machine learning neural
   // networks"} is ALSO 4 AND-ed clauses, but that AND is doing real,
   // intentional work (274 on-topic hits vs 104 for the literal 4-word phrase,
@@ -1283,6 +1284,17 @@ async function searchPatents(args: Record<string, unknown>) {
   // multi-keyword call. Phrase-vs-phrase is a different shape: each phrase is
   // already a multi-word concept in its own right, so OR-ing whole concepts
   // together is a real broadening, not a collapse into single keywords.
+  //
+  // `synonymGroupsExpanded >= 2` extends the same gate to a query where the
+  // router named two DISTINCT concepts but only quoted one of them — measured
+  // live 2026-09-29: {query: '"cell-free RNA" residual cancer'} recognizes
+  // BOTH concepts (cfRNA-group + MRD-group) via synonym expansion regardless
+  // of quoting, but the raw text carries only 1 literal quoted phrase, so the
+  // quote-counting gate alone missed it and a real AND-of-two-concepts zero
+  // went unbroadened. Two recognized concepts is the same "OR-ing whole
+  // concepts together, not collapsing to single keywords" shape as two quoted
+  // phrases — it is not extended to a single recognized group (that case
+  // already collapses to one clause and has nothing to broaden against).
   const quotedPhraseCount = query ? (query.match(/"[^"]+"/g) ?? []).length : 0;
   let broadened = false;
   let broadenedFrom: string | null = null;
@@ -1290,7 +1302,7 @@ async function searchPatents(args: Record<string, unknown>) {
   // (fleet #2446) — distinct from `broadened`, which just means the OR retry
   // matched something.
   let rankedByPhraseMatch: string[] | null = null;
-  if (total === 0 && queryClauses.length > 1 && quotedPhraseCount >= 2) {
+  if (total === 0 && queryClauses.length > 1 && (quotedPhraseCount >= 2 || synonymGroupsExpanded >= 2)) {
     broadenedFrom = composedQ;
     const orClause = `(${queryClauses.join(' ')})`;
     composedQ = composeQ([orClause]);

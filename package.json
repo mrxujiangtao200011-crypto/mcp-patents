@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-patents",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Patents MCP — wraps the USPTO Open Data Portal (ODP) Patent File Wrapper API",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-fd2aa67ec322a5f0ba207e0ff0f96e6436bb74902e1164df3620eb83f1492bc2",
-    "sourceCommit": "b666f382f46d30ec43f4ea0aa3fa6b252f712af3"
+    "sourceHash": "v1-0551f1d4ff66c8f34f44d5ab523af2e4b85c23f38a62f5a68b3c653430b0f0b2",
+    "sourceCommit": "f5637ddae35189e1c162153111180f6c90b50597"
   }
 }
