@@ -933,6 +933,89 @@ function composeFreeText(raw: string): string[] {
 }
 
 /**
+ * Known synonym / abbreviation groups for concepts whose patent-filing
+ * wording varies by author (fleet #2450/#2499 — "Who has filed US patents on
+ * detecting residual cancer using cell-free RNA in the last three years?"
+ * measured unstable, 2 Strong/3 Weak of 5 router runs, because the class of
+ * fix in #2418 — OR-ing an AND-of-phrases on a genuine zero — only fires when
+ * the caller happens to QUOTE two or more phrases. Measured live 2026-09-29:
+ * {query: 'cfRNA "residual cancer"'} -> composed as `"residual cancer" AND
+ * "cfRNA"` -> 0 results, no broadening (only 1 QUOTED phrase in the raw
+ * query, so the #2418 gate never sees a second one to OR against) — even
+ * though the same two concepts phrased as {query: '"residual cancer"
+ * "cell-free RNA"'} finds 23 real hits (Cornell, Stanford, BostonGene, UC
+ * Regents). A fully bare {query: 'residual cancer cell-free RNA'} is worse:
+ * composeFreeText ANDs 4 separate single-word clauses and also returns 0
+ * silently. Neither shape has 2+ quoted phrases, so #2418's retry cannot see
+ * either one.
+ *
+ * Each group below is OR'd together as ONE clause (ODP: whitespace between
+ * bare/quoted terms is OR) and that clause is ANDed against the other
+ * concepts in the query — so "cfRNA" and "cell-free RNA" and "circulating
+ * RNA" become interchangeable at compose time, before any zero-result retry
+ * is needed, rather than requiring the caller (in practice, the router) to
+ * guess the one spelling a given patent uses. This is deliberately a short,
+ * curated list of documented production misses — not a general thesaurus —
+ * because an unrelated OR silently answers a different question (measured:
+ * OR-broadening a whole multi-concept query, rather than just its synonyms,
+ * once returned 21,937 largely off-topic matches, fleet #2450 annotation
+ * 54979).
+ */
+const SYNONYM_GROUPS: string[][] = [
+  ['cfRNA', 'cell-free RNA', 'cell free RNA', 'circulating RNA', 'circulating cell-free RNA', 'ccfRNA'],
+  ['MRD', 'minimal residual disease', 'molecular residual disease', 'residual cancer', 'residual disease'],
+];
+
+/** ODP OR syntax for one synonym: bare if a single word, quoted if it has a space. */
+function synonymTerm(term: string): string {
+  return term.includes(' ') ? `"${term}"` : term;
+}
+
+/**
+ * Rewrite every recognized synonym-group member found in `raw` to a single
+ * placeholder token (one alnum word, no quotes/spaces), so that when
+ * composeFreeText tokenizes the result it treats the whole matched phrase as
+ * ONE atomic clause rather than splitting a bare multi-word member (e.g.
+ * "cell-free RNA") into separately-AND-ed words. The placeholder -> finished
+ * OR-clause swap happens AFTER composeFreeText runs (see call site below),
+ * because composeFreeText itself would otherwise re-quote or re-split the
+ * clause text if we substituted the parenthesized OR clause in directly.
+ *
+ * Each group is matched with ONE alternation regex (longest member first, so
+ * e.g. "circulating cell-free RNA" is consumed whole before "circulating
+ * RNA" could match part of it), case-insensitive and word-bounded (no match
+ * inside a longer word). A group expands at most once per query: its FIRST
+ * match becomes the placeholder and any FURTHER mention of the same group
+ * elsewhere in the query — a caller who names two members of one concept is
+ * not asking for two different concepts — collapses to a single space rather
+ * than an empty string, so a mention that happened to be quoted leaves a
+ * blank `" "` phrase that composeFreeText's own blank-phrase handling
+ * already discards, instead of a stray `""` artifact.
+ */
+function expandSynonymGroups(raw: string): { text: string; placeholders: Map<string, string> } {
+  const placeholders = new Map<string, string>();
+  let text = raw;
+  let n = 0;
+  for (const group of SYNONYM_GROUPS) {
+    const alternation = [...group]
+      .sort((a, b) => b.length - a.length)
+      .map((term) => term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+      .join('|');
+    const re = new RegExp(`(?<![A-Za-z0-9])(?:${alternation})(?![A-Za-z0-9])`, 'gi');
+    let placeholder: string | null = null;
+    text = text.replace(re, () => {
+      if (placeholder === null) {
+        placeholder = `synonymgroup${n++}`;
+        placeholders.set(placeholder, `(${group.map(synonymTerm).join(' ')})`);
+        return placeholder;
+      }
+      return ' ';
+    });
+  }
+  return { text, placeholders };
+}
+
+/**
  * Argument synonyms.
  *
  * An agent reaches for the word its question used — "assignee" for a company,
@@ -976,14 +1059,14 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'search_patents',
     description:
-      'Search USPTO patent applications and grants — **without a `granted_after`/`granted_before` bound this returns the APPLICATION corpus sorted newest-FILED-first, not issued patents.** USPTO publishes an application ~18 months after filing and typically takes 2+ years to grant it, so the newest rows in an unfiltered search are always recent, unexamined filings with `grant_date: null` — that is expected, not stale data. **Pick the date field on the QUESTION\'S VERB, not on the word "recent":** a question asking who has FILED / applied for / sought patents in a window wants `filed_after`/`filed_before` — the default application corpus already includes pending AND granted patents, so no `granted_after` is needed or wanted, and adding one will silently drop recently-filed-but-not-yet-examined applications (grant lags filing by 2+ years, so "filed in the last 3 years" AND "granted in the last 3 years" are mostly DISJOINT sets). Only use `granted_after`/`granted_before` when the question explicitly says GRANTED / ISSUED / APPROVED / "has a patent" (not just "recent patents"). Use `query` for free-text keywords ("lithium battery", "crispr", "machine learning"); all terms are required (AND), and you can quote a phrase to keep it together. A question that names several DISTINCT ways of describing the same idea (e.g. a condition plus a detection method, each expressed as its own quoted phrase) should still be passed as one query — if the literal AND-of-everything match returns zero, the tool automatically retries once with those same quoted phrases OR\'d together instead and marks the response `broadened: true`; it never invents synonyms and it only ever relaxes multi-phrase AND to OR on a genuine zero, so a search that is narrow for a real reason (e.g. one specific applicant with no matching filings, or an ordinary bare-keyword AND) still correctly returns zero. Optional structured filters: `applicant` (exact corporate name as filed, e.g. "APPLE INC."), `inventor` (person name), `title` (words in the invention title), `number` (a specific application number), `filed_after` / `filed_before`, `granted_after` / `granted_before`. Common synonyms are understood — `assignee`, `company` and `owner` all reach `applicant`, and `keywords`, `q` or `text` all reach `query`. Results include title, application number, filing date, first applicant, all applicants, inventors, status, classification. `total` is the full match count but USPTO returns at most 25 records per search — narrow with applicant or a date range rather than raising `limit`. Powered by the USPTO Open Data Portal (data.uspto.gov).',
+      'Search USPTO patent applications and grants — **without a `granted_after`/`granted_before` bound this returns the APPLICATION corpus sorted newest-FILED-first, not issued patents.** USPTO publishes an application ~18 months after filing and typically takes 2+ years to grant it, so the newest rows in an unfiltered search are always recent, unexamined filings with `grant_date: null` — that is expected, not stale data. **Pick the date field on the QUESTION\'S VERB, not on the word "recent":** a question asking who has FILED / applied for / sought patents in a window wants `filed_after`/`filed_before` — the default application corpus already includes pending AND granted patents, so no `granted_after` is needed or wanted, and adding one will silently drop recently-filed-but-not-yet-examined applications (grant lags filing by 2+ years, so "filed in the last 3 years" AND "granted in the last 3 years" are mostly DISJOINT sets). Only use `granted_after`/`granted_before` when the question explicitly says GRANTED / ISSUED / APPROVED / "has a patent" (not just "recent patents"). Use `query` for free-text keywords ("lithium battery", "crispr", "machine learning"); all terms are required (AND), and you can quote a phrase to keep it together. A curated, short list of known synonym/abbreviation pairs for concepts that patents describe inconsistently (e.g. cfRNA / cell-free RNA / circulating RNA; MRD / minimal residual disease / residual cancer) is recognized in `query` — quoted or bare — and expanded to an OR group before the search runs, so "cfRNA" and "cell-free RNA" are treated as the same concept rather than requiring the caller to guess a specific patent\'s exact wording (marked `synonyms_expanded: true` in the response; this is a fixed, documented list, not general synonym invention). A question that names several DISTINCT ways of describing the same idea (e.g. a condition plus a detection method, each expressed as its own quoted phrase) should still be passed as one query — if the literal AND-of-everything match returns zero, the tool automatically retries once with those same quoted phrases OR\'d together instead and marks the response `broadened: true`; it only ever relaxes multi-phrase AND to OR on a genuine zero, so a search that is narrow for a real reason (e.g. one specific applicant with no matching filings, or an ordinary bare-keyword AND) still correctly returns zero. Optional structured filters: `applicant` (exact corporate name as filed, e.g. "APPLE INC."), `inventor` (person name), `title` (words in the invention title), `number` (a specific application number), `filed_after` / `filed_before`, `granted_after` / `granted_before`. Common synonyms are understood — `assignee`, `company` and `owner` all reach `applicant`, and `keywords`, `q` or `text` all reach `query`. Results include title, application number, filing date, first applicant, all applicants, inventors, status, classification. `total` is the full match count but USPTO returns at most 25 records per search — narrow with applicant or a date range rather than raising `limit`. Powered by the USPTO Open Data Portal (data.uspto.gov).',
     inputSchema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
           description:
-            'Free-text keywords. Every term must appear (they are AND-ed), so add words to narrow and remove words to widen. Wrap words in double quotes to require them adjacent: `"machine learning" model` needs the exact phrase plus the word model. Examples: "lithium battery", "crispr", "neural network". Pass "*" if you only want to filter by applicant/date with no keyword constraint. If several quoted phrases ANDed together match nothing, the tool retries once with them OR\'d instead (see `broadened` in the response) rather than returning a bare zero.',
+            'Free-text keywords. Every term must appear (they are AND-ed), so add words to narrow and remove words to widen. Wrap words in double quotes to require them adjacent: `"machine learning" model` needs the exact phrase plus the word model. Examples: "lithium battery", "crispr", "neural network". Pass "*" if you only want to filter by applicant/date with no keyword constraint. A curated set of known synonyms/abbreviations (e.g. cfRNA / cell-free RNA / circulating RNA, or MRD / minimal residual disease / residual cancer) is automatically expanded to an OR group within the query — quoted or bare, either form is recognized — so you do not need to guess which exact wording a given patent uses (see `synonyms_expanded` in the response). If several quoted phrases ANDed together still match nothing, the tool retries once with them OR\'d instead (see `broadened` in the response) rather than returning a bare zero.',
         },
         applicant: {
           type: 'string',
@@ -1123,7 +1206,21 @@ async function searchPatents(args: Record<string, unknown>) {
   // relax only the free-text side — broadening a structural filter like
   // `applicant` would answer a different question, which is why that stays
   // untouched below (see `emptyWithFilter`'s own explanation instead).
-  const queryClauses = query && query !== '*' ? composeFreeText(query) : [];
+  //
+  // Synonym-group expansion (fleet #2450/#2499) runs BEFORE composeFreeText,
+  // on the raw text, so a bare multi-word synonym like "cell-free RNA" is
+  // recognized and replaced as one unit rather than split into separately
+  // AND-ed words. `synonymGroupsApplied` records which placeholder maps to
+  // which finished OR-clause so it can be swapped back in once
+  // composeFreeText has produced its (quoted) clause list.
+  const synonymExpansion = query && query !== '*' ? expandSynonymGroups(query) : null;
+  const queryClauses = synonymExpansion
+    ? composeFreeText(synonymExpansion.text).map((c) => {
+        const bare = c.replace(/^"|"$/g, '');
+        return synonymExpansion.placeholders.get(bare) ?? c;
+      })
+    : [];
+  const synonymGroupsExpanded = synonymExpansion ? synonymExpansion.placeholders.size : 0;
   const structuralParts: string[] = [];
   if (title) structuralParts.push(`${FIELD_TITLE}:"${title.replace(/"/g, '')}"`);
   if (applicant) structuralParts.push(`${FIELD_APPLICANT}:"${applicant.replace(/"/g, '')}"`);
@@ -1255,6 +1352,12 @@ async function searchPatents(args: Record<string, unknown>) {
 
   return {
     query: composedQ,
+    ...(synonymGroupsExpanded > 0
+      ? {
+          synonyms_expanded: true,
+          synonyms_note: `${synonymGroupsExpanded} term(s) in your query were expanded to a curated group of known synonyms/abbreviations (e.g. cfRNA / cell-free RNA / circulating RNA, or MRD / minimal residual disease / residual cancer) and OR'd together within the query — see \`query\` above for the exact clause sent upstream.`,
+        }
+      : {}),
     filters: {
       applicant: applicant ?? null,
       inventor: inventor ?? null,
